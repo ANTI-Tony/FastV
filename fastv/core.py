@@ -66,9 +66,14 @@ def get_multimodal_embeds(model, input_ids, image_tensor):
 
     image_features = model.encode_images(image_tensor)
     embed_tokens = model.get_model().embed_tokens
-    input_embeds = embed_tokens(input_ids)
 
-    image_mask = input_ids[0] == IMAGE_TOKEN_INDEX
+    # IMAGE_TOKEN_INDEX = -200, out of range for embedding table
+    # Replace with 0 before embedding, then use prefix/suffix only
+    safe_ids = input_ids.clone()
+    image_mask = safe_ids[0] == IMAGE_TOKEN_INDEX
+    safe_ids[0][image_mask] = 0
+    input_embeds = embed_tokens(safe_ids)
+
     image_pos = image_mask.nonzero(as_tuple=True)[0]
 
     if len(image_pos) == 0:

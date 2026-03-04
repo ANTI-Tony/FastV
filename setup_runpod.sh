@@ -43,34 +43,23 @@ pip install \
     "huggingface_hub>=0.19.0" \
     "numpy<2.0.0"
 
-# 4. 卸掉 bitsandbytes 并 patch accelerate
-#    问题链: accelerate 0.21.0 无条件 import bnb → 系统 bnb 缺 CUDA 库 → crash
-#    新版 bnb 需要新 PyTorch → 也 crash。FastV 不需要量化，直接跳过。
+# 4. Patch accelerate 跳过 bitsandbytes
+#    问题: 系统 bnb 坏了且无法卸载 (系统包在 venv 外)
+#    accelerate 0.21.0 无条件 import bnb → crash
+#    解决: 直接用 sed patch 文件，不 import 任何 Python 包
 echo "[4/6] Patch accelerate (跳过 bitsandbytes)..."
-pip uninstall bitsandbytes -y 2>/dev/null || true
-
-# 找到 accelerate 的 bnb.py 并 patch：把 import 包在 try/except 里
-python3 << 'PATCH_EOF'
-import accelerate, os
-
-bnb_path = os.path.join(os.path.dirname(accelerate.__file__), "utils", "bnb.py")
-with open(bnb_path) as f:
-    content = f.read()
-
-old = "import bitsandbytes as bnb"
-new = """try:
-    import bitsandbytes as bnb
-except (ImportError, RuntimeError, AttributeError):
-    bnb = None"""
-
-if old in content and "try:" not in content.split(old)[0][-10:]:
-    content = content.replace(old, new, 1)
-    with open(bnb_path, "w") as f:
-        f.write(content)
-    print(f"  已 patch: {bnb_path}")
-else:
-    print(f"  已经 patch 过或无需修改")
-PATCH_EOF
+ACCEL_BNB="$VENV_DIR/lib/python3.11/site-packages/accelerate/utils/bnb.py"
+if [ -f "$ACCEL_BNB" ]; then
+    # 把 "import bitsandbytes as bnb" 替换成 try/except
+    if grep -q "^import bitsandbytes as bnb" "$ACCEL_BNB"; then
+        sed -i 's/^import bitsandbytes as bnb/try:\n    import bitsandbytes as bnb\nexcept (ImportError, RuntimeError, AttributeError):\n    bnb = None/' "$ACCEL_BNB"
+        echo "  已 patch: $ACCEL_BNB"
+    else
+        echo "  已经 patch 过或无需修改"
+    fi
+else
+    echo "  警告: 找不到 $ACCEL_BNB"
+fi
 
 # 5. 安装 LLaVA
 echo "[5/6] 安装 LLaVA..."

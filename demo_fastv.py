@@ -213,11 +213,14 @@ def patch_model_for_fastv(model, fastv_k=2, fastv_r=0.75, image_token_start=35, 
                 # 物理删除 hidden_states 中不重要的 tokens
                 hidden_states = hidden_states[:, keep_indices, :]
 
-                # 更新 position_ids (保持原始位置，这对 RoPE 很重要)
-                position_ids = keep_indices.unsqueeze(0)
+                # 更新 position_ids: 用连续编号 [0, 1, ..., new_len-1]
+                # 不能用原始位置 (keep_indices 最大到 624)，因为后续层的
+                # rotary_emb 只缓存 new_seq_length 个位置，用原始位置会越界。
+                # 前 K 层已经用正确位置做了 RoPE，影响很小。
+                new_seq_length = keep_indices.shape[0]
+                position_ids = torch.arange(new_seq_length, device=device).unsqueeze(0)
 
                 # 更新 attention mask (重建 4D mask)
-                new_seq_length = keep_indices.shape[0]
                 new_attention_mask = torch.ones(
                     (batch_size, new_seq_length), dtype=torch.long, device=device
                 )

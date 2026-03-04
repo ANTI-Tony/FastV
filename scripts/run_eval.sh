@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# 自动激活 venv
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$(dirname "$SCRIPT_DIR")/venv"
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+fi
+
 echo "============================================"
 echo "  FastV 完整评测流程"
 echo "============================================"

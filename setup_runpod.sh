@@ -22,13 +22,8 @@ source "$VENV_DIR/bin/activate"
 echo "  检查系统 PyTorch..."
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0)}')"
 
-# 3. 修复系统坏掉的 bitsandbytes（accelerate 会 import 它）
-#    系统的 bnb 找不到 libcusparse.so.11，在 venv 里装一个能用的版本覆盖它
-echo "[3/6] 修复 bitsandbytes..."
-pip install "bitsandbytes>=0.43.0"
-
-# 4. 强制安装 LLaVA 要求的精确版本（覆盖系统的新版本）
-echo "[4/6] 安装 LLaVA 兼容的依赖版本..."
+# 3. 强制安装 LLaVA 要求的精确版本（覆盖系统的新版本）
+echo "[3/6] 安装 LLaVA 兼容的依赖版本..."
 pip install --force-reinstall --no-deps \
     "transformers==4.37.2" \
     "tokenizers==0.15.1" \
@@ -47,6 +42,35 @@ pip install \
     "seaborn>=0.13.0" \
     "huggingface_hub>=0.19.0" \
     "numpy<2.0.0"
+
+# 4. 卸掉 bitsandbytes 并 patch accelerate
+#    问题链: accelerate 0.21.0 无条件 import bnb → 系统 bnb 缺 CUDA 库 → crash
+#    新版 bnb 需要新 PyTorch → 也 crash。FastV 不需要量化，直接跳过。
+echo "[4/6] Patch accelerate (跳过 bitsandbytes)..."
+pip uninstall bitsandbytes -y 2>/dev/null || true
+
+# 找到 accelerate 的 bnb.py 并 patch：把 import 包在 try/except 里
+python3 << 'PATCH_EOF'
+import accelerate, os
+
+bnb_path = os.path.join(os.path.dirname(accelerate.__file__), "utils", "bnb.py")
+with open(bnb_path) as f:
+    content = f.read()
+
+old = "import bitsandbytes as bnb"
+new = """try:
+    import bitsandbytes as bnb
+except (ImportError, RuntimeError, AttributeError):
+    bnb = None"""
+
+if old in content and "try:" not in content.split(old)[0][-10:]:
+    content = content.replace(old, new, 1)
+    with open(bnb_path, "w") as f:
+        f.write(content)
+    print(f"  已 patch: {bnb_path}")
+else:
+    print(f"  已经 patch 过或无需修改")
+PATCH_EOF
 
 # 5. 安装 LLaVA
 echo "[5/6] 安装 LLaVA..."

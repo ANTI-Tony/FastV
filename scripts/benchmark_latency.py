@@ -4,29 +4,29 @@
 测量不同 FastV 配置下的推理延迟和显存使用
 
 用法:
-    python scripts/benchmark_latency.py
-    python scripts/benchmark_latency.py --model-path models/llava-v1.5-7b
-    python scripts/benchmark_latency.py --model-path liuhaotian/llava-v1.5-13b
+    bash run.sh python scripts/benchmark_latency.py
+    bash run.sh python scripts/benchmark_latency.py --model-path models/llava-v1.5-7b
 """
 
 import argparse
+import sys
+import os
 import time
 import gc
+import json
+
 import torch
 import numpy as np
 from PIL import Image
-from transformers import LlavaForConditionalGeneration, AutoProcessor
 
-from fastv.fastv_llama import compute_image_token_importance, select_important_tokens
+# 添加项目根目录到 path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fastv.core import load_model, prepare_input, run_vanilla, run_fastv
 
 
-def benchmark_config(model, processor, image, prompt, device, fastv_r=0.0, fastv_k=2, num_runs=5):
-    """
-    测试一个特定配置的延迟
-
-    fastv_r=0.0 表示不剪枝 (vanilla)
-    """
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+def benchmark_config(model, tokenizer, input_ids, image_tensor, device,
+                     fastv_r=0.0, fastv_k=2, num_runs=5, max_new_tokens=128):
+    """测试一个配置的延迟"""
     times = []
 
     for i in range(num_runs + 2):  # 前2次预热
@@ -36,62 +36,24 @@ def benchmark_config(model, processor, image, prompt, device, fastv_r=0.0, fastv
 
         with torch.no_grad():
             if fastv_r == 0.0:
-                # Vanilla
-                output = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+                _ = run_vanilla(model, tokenizer, input_ids, image_tensor, device, max_new_tokens)
             else:
-                # FastV
-                outputs = model(**inputs, output_attentions=True, return_dict=True, use_cache=True)
-                seq_len = outputs.logits.shape[1]
-
-                attn_k = outputs.attentions[fastv_k - 1]
-                image_length = 576
-                image_start = max(0, seq_len - image_length - (inputs['input_ids'].shape[1] - 1))
-
-                importance = compute_image_token_importance(attn_k, image_start, image_length)
-                num_keep = int(image_length * (1 - fastv_r))
-                keep_indices = select_important_tokens(importance, num_keep)
-
-                # Build pruned KV cache
-                prefix_idx = torch.arange(image_start, device=device)
-                selected_img_idx = keep_indices[0] + image_start
-                suffix_idx = torch.arange(image_start + image_length, seq_len, device=device)
-                keep_all = torch.cat([prefix_idx, selected_img_idx, suffix_idx])
-
-                pruned_past = tuple(
-                    (k[:, :, keep_all, :], v[:, :, keep_all, :])
-                    for k, v in outputs.past_key_values
-                )
-
-                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                generated_ids = [next_token]
-                attn_mask = torch.ones((1, keep_all.shape[0] + 1), dtype=torch.long, device=device)
-                eos = getattr(model.config, 'eos_token_id', 2)
-
-                for _ in range(127):
-                    out = model.language_model(
-                        input_ids=next_token, attention_mask=attn_mask,
-                        past_key_values=pruned_past, use_cache=True, return_dict=True,
-                    )
-                    pruned_past = out.past_key_values
-                    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                    if next_token.item() == eos:
-                        break
-                    generated_ids.append(next_token)
-                    attn_mask = torch.cat([attn_mask, torch.ones((1, 1), dtype=torch.long, device=device)], dim=1)
+                _ = run_fastv(model, tokenizer, input_ids, image_tensor, device,
+                              fastv_k=fastv_k, fastv_r=fastv_r, max_new_tokens=max_new_tokens)
 
         torch.cuda.synchronize()
         elapsed = time.time() - start
 
-        if i >= 2:  # 跳过前2次预热
+        if i >= 2:  # 跳过预热
             times.append(elapsed)
 
     peak_mem = torch.cuda.max_memory_allocated() / 1024**3
     return {
-        'mean': np.mean(times),
-        'std': np.std(times),
-        'min': np.min(times),
-        'max': np.max(times),
-        'peak_mem_gb': peak_mem,
+        'mean': float(np.mean(times)),
+        'std': float(np.std(times)),
+        'min': float(np.min(times)),
+        'max': float(np.max(times)),
+        'peak_mem_gb': float(peak_mem),
     }
 
 
@@ -103,16 +65,14 @@ def main():
 
     device = 'cuda'
     print(f"加载模型: {args.model_path}")
+    tokenizer, model, image_processor, context_len = load_model(args.model_path, device)
 
-    processor = AutoProcessor.from_pretrained(args.model_path)
-    model = LlavaForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16, device_map="auto",
-    )
-    model.eval()
-
-    # 创建测试图片 (纯色，用于标准化测试)
+    # 创建测试图片 (灰色, 用于标准化测试)
     image = Image.new('RGB', (336, 336), color=(128, 128, 128))
-    prompt = "USER: <image>\nDescribe this image in detail.\nASSISTANT:"
+    prompt = "Describe this image in detail."
+
+    from fastv.core import prepare_input as prep
+    input_ids, image_tensor = prep(tokenizer, image_processor, image, prompt, device)
 
     configs = [
         {'name': 'Vanilla (no FastV)', 'fastv_r': 0.0, 'fastv_k': 2},
@@ -135,7 +95,7 @@ def main():
         torch.cuda.empty_cache()
 
         result = benchmark_config(
-            model, processor, image, prompt, device,
+            model, tokenizer, input_ids, image_tensor, device,
             fastv_r=cfg['fastv_r'],
             fastv_k=cfg['fastv_k'],
             num_runs=args.num_runs,
@@ -149,13 +109,10 @@ def main():
         print(f"{cfg['name']:<25} | {result['mean']:>8.3f} | {result['std']:>8.3f} | "
               f"{result['min']:>8.3f} | {result['peak_mem_gb']:>8.1f} | {speedup:>7.2f}x")
 
-        results.append({**cfg, **result, 'speedup': speedup})
+        results.append({**cfg, **result, 'speedup': float(speedup)})
 
     print(f"{'='*80}")
 
-    # 保存结果
-    import json
-    import os
     os.makedirs('results', exist_ok=True)
     with open('results/latency_benchmark.json', 'w') as f:
         json.dump(results, f, indent=2)

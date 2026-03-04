@@ -4,77 +4,24 @@ TextVQA 评测脚本
 评测 FastV 在 TextVQA 上的准确率
 
 用法:
-    python scripts/eval_textvqa.py
-    python scripts/eval_textvqa.py --fastv-r 0.75
-    python scripts/eval_textvqa.py --fastv-r 0.0  # Vanilla baseline
+    bash run.sh python scripts/eval_textvqa.py
+    bash run.sh python scripts/eval_textvqa.py --fastv-r 0.75
+    bash run.sh python scripts/eval_textvqa.py --fastv-r 0.0  # Vanilla baseline
 """
 
 import argparse
 import json
 import os
+import sys
 import time
 from tqdm import tqdm
 
 import torch
 from PIL import Image
-from transformers import LlavaForConditionalGeneration, AutoProcessor
 
-from fastv.fastv_llama import compute_image_token_importance, select_important_tokens
-
-
-def generate_with_fastv(model, processor, image, prompt, device, fastv_k, fastv_r, max_new_tokens=128):
-    """带 FastV 的推理"""
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
-
-    if fastv_r == 0.0:
-        # Vanilla
-        with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        return processor.decode(output[0], skip_special_tokens=True)
-
-    # FastV
-    with torch.no_grad():
-        outputs = model(**inputs, output_attentions=True, return_dict=True, use_cache=True)
-
-    seq_len = outputs.logits.shape[1]
-    attn_k = outputs.attentions[fastv_k - 1]
-    image_length = 576
-    image_start = max(0, seq_len - image_length - (inputs['input_ids'].shape[1] - 1))
-
-    importance = compute_image_token_importance(attn_k, image_start, image_length)
-    num_keep = int(image_length * (1 - fastv_r))
-    keep_indices = select_important_tokens(importance, num_keep)
-
-    prefix_idx = torch.arange(image_start, device=device)
-    selected_img_idx = keep_indices[0] + image_start
-    suffix_idx = torch.arange(image_start + image_length, seq_len, device=device)
-    keep_all = torch.cat([prefix_idx, selected_img_idx, suffix_idx])
-
-    pruned_past = tuple(
-        (k[:, :, keep_all, :], v[:, :, keep_all, :])
-        for k, v in outputs.past_key_values
-    )
-
-    next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    generated_ids = [next_token]
-    attn_mask = torch.ones((1, keep_all.shape[0] + 1), dtype=torch.long, device=device)
-    eos = getattr(model.config, 'eos_token_id', 2)
-
-    for _ in range(max_new_tokens - 1):
-        with torch.no_grad():
-            out = model.language_model(
-                input_ids=next_token, attention_mask=attn_mask,
-                past_key_values=pruned_past, use_cache=True, return_dict=True,
-            )
-        pruned_past = out.past_key_values
-        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        if next_token.item() == eos:
-            break
-        generated_ids.append(next_token)
-        attn_mask = torch.cat([attn_mask, torch.ones((1, 1), dtype=torch.long, device=device)], dim=1)
-
-    all_ids = torch.cat(generated_ids, dim=1)
-    return processor.decode(all_ids[0], skip_special_tokens=True)
+# 添加项目根目录到 path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fastv.core import load_model, prepare_input, run_vanilla, run_fastv
 
 
 def textvqa_accuracy(pred: str, answers: list) -> float:
@@ -107,11 +54,7 @@ def main():
 
     # 加载模型
     print(f"加载模型: {args.model_path}")
-    processor = AutoProcessor.from_pretrained(args.model_path)
-    model = LlavaForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.float16, device_map="auto",
-    )
-    model.eval()
+    tokenizer, model, image_processor, context_len = load_model(args.model_path, device)
 
     # 加载数据
     print(f"加载数据: {args.data_path}")
@@ -127,6 +70,7 @@ def main():
     correct = 0
     total = 0
     results = []
+    total_time = 0
 
     for item in tqdm(data, desc=f"TextVQA [{config_name}]"):
         image_id = item['image_id']
@@ -139,12 +83,17 @@ def main():
 
         try:
             image = Image.open(image_path).convert('RGB')
-            prompt = f"USER: <image>\n{question}\nASSISTANT:"
-
-            pred = generate_with_fastv(
-                model, processor, image, prompt, device,
-                args.fastv_k, args.fastv_r,
+            input_ids, image_tensor = prepare_input(
+                tokenizer, image_processor, image, question, device
             )
+
+            start = time.time()
+            if args.fastv_r == 0.0:
+                pred = run_vanilla(model, tokenizer, input_ids, image_tensor, device, max_new_tokens=128)
+            else:
+                pred = run_fastv(model, tokenizer, input_ids, image_tensor, device,
+                                 fastv_k=args.fastv_k, fastv_r=args.fastv_r, max_new_tokens=128)
+            total_time += time.time() - start
 
             acc = textvqa_accuracy(pred, answers)
             correct += acc
@@ -164,9 +113,11 @@ def main():
 
     # 输出结果
     final_acc = correct / total * 100 if total > 0 else 0
+    avg_time = total_time / total if total > 0 else 0
     print(f"\n{'='*50}")
     print(f"TextVQA 结果 [{config_name}]")
     print(f"  准确率: {final_acc:.2f}% ({correct:.1f}/{total})")
+    print(f"  平均推理时间: {avg_time:.3f}s/sample")
     print(f"{'='*50}")
 
     # 保存
@@ -179,6 +130,7 @@ def main():
             'fastv_r': args.fastv_r,
             'accuracy': final_acc,
             'total': total,
+            'avg_time': avg_time,
             'results': results,
         }, f, indent=2, ensure_ascii=False)
     print(f"结果已保存到: {output_file}")

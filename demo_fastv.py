@@ -1,300 +1,20 @@
 """
 FastV 推理 Demo
 
-通过 monkey-patch LlamaModel.forward 实现原论文的 inplace token dropping:
-在第 K 层后，根据注意力分数丢弃 R% 的 image tokens。
+方式: 两步法
+  Step 1: 完整 forward 拿第 K 层注意力分数，计算 image token 重要性
+  Step 2: 只保留重要 image tokens，重新构建 inputs_embeds 跑 generate()
 
 用法:
     bash run.sh python demo_fastv.py --model-path models/llava-v1.5-7b
-    bash run.sh python demo_fastv.py --fastv-k 2 --fastv-r 0.75
     bash run.sh python demo_fastv.py --fastv-k 2 --fastv-r 0.5
 """
 
 import argparse
 import time
 import torch
-from PIL import Image
-import requests
-from io import BytesIO
 
-
-def load_image(image_source: str) -> Image.Image:
-    if image_source.startswith(('http://', 'https://')):
-        response = requests.get(image_source)
-        image = Image.open(BytesIO(response.content))
-    else:
-        image = Image.open(image_source)
-    return image.convert('RGB')
-
-
-def load_model(model_path, device):
-    from llava.model.builder import load_pretrained_model
-    from llava.mm_utils import get_model_name_from_path
-
-    model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(
-        model_path, None, model_name,
-        device_map="auto",
-        torch_dtype=torch.float16,
-    )
-    model.eval()
-    return tokenizer, model, image_processor, context_len
-
-
-def prepare_input(tokenizer, image_processor, image, prompt, device):
-    from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
-    from llava.conversation import conv_templates
-    from llava.mm_utils import tokenizer_image_token, process_images
-
-    conv = conv_templates["v1"].copy()
-    if DEFAULT_IMAGE_TOKEN not in prompt:
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
-    conv.append_message(conv.roles[0], prompt)
-    conv.append_message(conv.roles[1], None)
-    full_prompt = conv.get_prompt()
-
-    input_ids = tokenizer_image_token(
-        full_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-    ).unsqueeze(0).to(device)
-    image_tensor = process_images([image], image_processor, None).to(device, dtype=torch.float16)
-
-    return input_ids, image_tensor
-
-
-# ============================================================
-#  FastV: Monkey-patch LlamaModel.forward
-#  在第 K 层之后丢弃低注意力的 image tokens (原论文方式)
-# ============================================================
-
-def patch_model_for_fastv(model, fastv_k=2, fastv_r=0.75, image_token_start=35, image_token_length=576):
-    """
-    Monkey-patch 模型实现 FastV inplace token dropping
-
-    原理: 修改 LlamaModel.forward()，在第 K 层输出后:
-    1. 从该层的注意力权重中计算 image token 重要性
-    2. 保留 top-(1-R) 的 image tokens
-    3. 从 hidden_states 中物理删除不重要的 tokens
-    4. 后续层处理更少的 tokens → 真正的加速
-    """
-    import transformers.models.llama.modeling_llama as llama_module
-
-    # 保存原始 forward
-    LlamaModel = llama_module.LlamaModel
-    original_forward = LlamaModel.forward
-
-    # FastV 状态
-    fastv_state = {
-        'enabled': True,
-        'pruned_this_pass': False,
-        'num_kept': 0,
-        'num_pruned': 0,
-    }
-
-    def fastv_forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        """
-        修改后的 LlamaModel.forward()
-
-        和原版唯一的区别: 在第 K 层之后 drop image tokens
-        """
-        from transformers.modeling_outputs import BaseModelOutputWithPast
-        from transformers.models.llama.modeling_llama import (
-            _prepare_4d_causal_attention_mask,
-        )
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # 获取 inputs_embeds
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        batch_size, seq_length, _ = inputs_embeds.shape
-        seq_length_with_past = seq_length
-
-        past_key_values_length = 0
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-
-        if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length_with_past,
-                dtype=torch.long, device=device
-            ).unsqueeze(0)
-
-        # 4D causal mask
-        attention_mask_4d = _prepare_4d_causal_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        )
-
-        hidden_states = inputs_embeds
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
-
-        # 是否应该在这次 pass 中执行 FastV 剪枝
-        # 只在 prefill (seq_length > 1) 且有足够 image tokens 时剪枝
-        should_prune = (
-            fastv_state['enabled']
-            and seq_length > 1  # prefill, 不是 decode
-            and past_key_values is None  # 首次 forward, 不是续生成
-            and seq_length > image_token_start + image_token_length
-        )
-
-        for idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
-
-            # 在第 K 层, 强制 output_attentions 以获取注意力权重
-            layer_output_attentions = output_attentions
-            if should_prune and idx == fastv_k - 1:
-                layer_output_attentions = True
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask_4d,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=layer_output_attentions,
-                use_cache=use_cache,
-            )
-
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                # 提取 KV cache: 位置取决于是否有 attention weights
-                cache_idx = 2 if layer_output_attentions else 1
-                kv_cache = layer_outputs[cache_idx] if len(layer_outputs) > cache_idx else None
-                next_decoder_cache += (kv_cache,)
-
-            if layer_output_attentions and len(layer_outputs) > 1 and layer_outputs[1] is not None:
-                if all_self_attns is None:
-                    all_self_attns = ()
-                all_self_attns += (layer_outputs[1],)
-
-            # ========== FastV: 在第 K 层之后执行 token dropping ==========
-            if should_prune and idx == fastv_k - 1:
-                attn_weights = layer_outputs[1]  # (batch, heads, seq, seq)
-
-                # 计算 image tokens 的重要性
-                # 取最后一个 token 对 image tokens 的注意力，对 heads 取平均
-                img_attn = attn_weights[:, :, -1, image_token_start:image_token_start + image_token_length]
-                importance = img_attn.mean(dim=1)  # (batch, image_token_length)
-
-                # 选择要保留的 top-k image tokens
-                num_keep = int(image_token_length * (1 - fastv_r))
-                _, top_indices = importance.topk(num_keep, dim=-1)
-                top_indices = top_indices.sort(dim=-1).values  # 保持原始顺序
-
-                # 构建完整的保留索引
-                device = hidden_states.device
-                prefix_idx = torch.arange(image_token_start, device=device)
-                selected_img_idx = top_indices[0] + image_token_start
-                suffix_start = image_token_start + image_token_length
-                suffix_idx = torch.arange(suffix_start, seq_length, device=device)
-                keep_indices = torch.cat([prefix_idx, selected_img_idx, suffix_idx])
-
-                # 物理删除 hidden_states 中不重要的 tokens
-                hidden_states = hidden_states[:, keep_indices, :]
-
-                # 更新 position_ids: 用连续编号 [0, 1, ..., new_len-1]
-                # 不能用原始位置 (keep_indices 最大到 624)，因为后续层的
-                # rotary_emb 只缓存 new_seq_length 个位置，用原始位置会越界。
-                # 前 K 层已经用正确位置做了 RoPE，影响很小。
-                new_seq_length = keep_indices.shape[0]
-                position_ids = torch.arange(new_seq_length, device=device).unsqueeze(0)
-
-                # 更新 attention mask (重建 4D mask)
-                new_attention_mask = torch.ones(
-                    (batch_size, new_seq_length), dtype=torch.long, device=device
-                )
-                attention_mask_4d = _prepare_4d_causal_attention_mask(
-                    new_attention_mask, (batch_size, new_seq_length), hidden_states, 0
-                )
-
-                # 更新 KV cache (已缓存的层也需要剪枝)
-                pruned_cache = ()
-                for i, layer_cache in enumerate(next_decoder_cache):
-                    if layer_cache is None:
-                        pruned_cache += (None,)
-                        continue
-                    k, v = layer_cache[0], layer_cache[1]
-                    pruned_cache += ((k[:, :, keep_indices, :], v[:, :, keep_indices, :]),)
-                next_decoder_cache = pruned_cache
-
-                seq_length = new_seq_length
-                should_prune = False  # 只剪一次
-
-                fastv_state['pruned_this_pass'] = True
-                fastv_state['num_kept'] = num_keep
-                fastv_state['num_pruned'] = image_token_length - num_keep
-
-        hidden_states = self.norm(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        next_cache = next_decoder_cache if use_cache else None
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
-
-    # 应用 monkey-patch
-    LlamaModel.forward = fastv_forward
-
-    return fastv_state
-
-
-def unpatch_model(model):
-    """恢复原始 forward"""
-    import transformers.models.llama.modeling_llama as llama_module
-    # 重新导入会恢复原始方法
-    import importlib
-    importlib.reload(llama_module)
-
-
-def run_generate(model, tokenizer, input_ids, image_tensor, device, max_new_tokens=256):
-    """用 model.generate() 生成"""
-    torch.cuda.synchronize()
-    start = time.time()
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor,
-            do_sample=False,
-            max_new_tokens=max_new_tokens,
-        )
-
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
-
-    new_tokens = output_ids[:, input_ids.shape[1]:]
-    response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
-    return response, elapsed
+from fastv.core import load_image, load_model, prepare_input, run_vanilla, run_fastv
 
 
 def main():
@@ -331,9 +51,13 @@ def main():
 
     # ========== Vanilla ==========
     print("\n" + "=" * 60)
-    print("  Vanilla 推理 (无 FastV)")
+    print("  Vanilla 推理 (576 image tokens)")
     print("=" * 60)
-    vanilla_resp, vanilla_time = run_generate(model, tokenizer, input_ids, image_tensor, device)
+    torch.cuda.synchronize()
+    start = time.time()
+    vanilla_resp = run_vanilla(model, tokenizer, input_ids, image_tensor, device)
+    torch.cuda.synchronize()
+    vanilla_time = time.time() - start
     print(f"  耗时: {vanilla_time:.3f}s")
     print(f"  输出: {vanilla_resp[:500]}")
 
@@ -341,25 +65,14 @@ def main():
     print("\n" + "=" * 60)
     print(f"  FastV 推理 (K={args.fastv_k}, R={args.fastv_r})")
     print("=" * 60)
-
-    # 检测 image token 起始位置
-    img_placeholder_pos = (input_ids[0] == -200).nonzero(as_tuple=True)[0]
-    image_start = img_placeholder_pos[0].item() if len(img_placeholder_pos) > 0 else 35
-
-    # Patch 模型
-    fastv_state = patch_model_for_fastv(
-        model,
-        fastv_k=args.fastv_k,
-        fastv_r=args.fastv_r,
-        image_token_start=image_start,
-        image_token_length=576,
+    torch.cuda.synchronize()
+    start = time.time()
+    fastv_resp = run_fastv(
+        model, tokenizer, input_ids, image_tensor, device,
+        fastv_k=args.fastv_k, fastv_r=args.fastv_r, verbose=True,
     )
-
-    fastv_resp, fastv_time = run_generate(model, tokenizer, input_ids, image_tensor, device)
-
-    if fastv_state['pruned_this_pass']:
-        print(f"  FastV: 保留 {fastv_state['num_kept']}/576, "
-              f"剪掉 {fastv_state['num_pruned']} ({args.fastv_r*100:.0f}%)")
+    torch.cuda.synchronize()
+    fastv_time = time.time() - start
     print(f"  耗时: {fastv_time:.3f}s")
     print(f"  输出: {fastv_resp[:500]}")
 
@@ -371,6 +84,8 @@ def main():
     print(f"  Vanilla 耗时:  {vanilla_time:.3f}s")
     print(f"  FastV 耗时:    {fastv_time:.3f}s")
     print(f"  加速比:        {speedup:.2f}x")
+    print(f"  Token 节省:    {576 - int(576*(1-args.fastv_r))}/{576} ({args.fastv_r*100:.0f}%)")
+    print(f"  理论 FLOPs:    ~{(1-args.fastv_r)*100:.0f}% of vanilla (layers {args.fastv_k}~32)")
 
     if torch.cuda.is_available():
         mem_gb = torch.cuda.max_memory_allocated() / 1024**3

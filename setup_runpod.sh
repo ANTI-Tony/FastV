@@ -22,9 +22,13 @@ source "$VENV_DIR/bin/activate"
 echo "  检查系统 PyTorch..."
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0)}')"
 
-# 3. 强制安装 LLaVA 要求的精确版本（覆盖系统的新版本）
-#    注意：不装 bitsandbytes（FastV 复现不需要量化，且 bnb 和 RunPod CUDA 容易冲突）
-echo "[3/5] 安装 LLaVA 兼容的依赖版本..."
+# 3. 修复系统坏掉的 bitsandbytes（accelerate 会 import 它）
+#    系统的 bnb 找不到 libcusparse.so.11，在 venv 里装一个能用的版本覆盖它
+echo "[3/6] 修复 bitsandbytes..."
+pip install "bitsandbytes>=0.43.0"
+
+# 4. 强制安装 LLaVA 要求的精确版本（覆盖系统的新版本）
+echo "[4/6] 安装 LLaVA 兼容的依赖版本..."
 pip install --force-reinstall --no-deps \
     "transformers==4.37.2" \
     "tokenizers==0.15.1" \
@@ -44,8 +48,8 @@ pip install \
     "huggingface_hub>=0.19.0" \
     "numpy<2.0.0"
 
-# 4. 安装 LLaVA
-echo "[4/5] 安装 LLaVA..."
+# 5. 安装 LLaVA
+echo "[5/6] 安装 LLaVA..."
 mkdir -p third_party
 if [ ! -d "third_party/LLaVA" ]; then
     cd third_party
@@ -59,8 +63,8 @@ pip install shortuuid fastapi uvicorn markdown2 \
     pydantic httpcore anyio open_clip_torch 2>/dev/null || true
 cd ../..
 
-# 5. 安装评测工具
-echo "[5/5] 安装评测工具..."
+# 6. 安装评测工具
+echo "[6/6] 安装评测工具..."
 pip install pycocoevalcap 2>/dev/null || true
 
 # 验证安装

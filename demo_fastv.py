@@ -180,7 +180,9 @@ def patch_model_for_fastv(model, fastv_k=2, fastv_r=0.75, image_token_start=35, 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if layer_output_attentions else 1],)
 
-            if layer_output_attentions:
+            if layer_output_attentions and layer_outputs[1] is not None:
+                if all_self_attns is None:
+                    all_self_attns = ()
                 all_self_attns += (layer_outputs[1],)
 
             # ========== FastV: 在第 K 层之后执行 token dropping ==========

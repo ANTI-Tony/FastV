@@ -1,14 +1,9 @@
 """
-FastV 推理 Demo
-
-支持两种加载方式:
-  1. LLaVA 原生 (推荐，兼容性好): pip install -e third_party/LLaVA
-  2. HuggingFace LlavaForConditionalGeneration (需要 transformers>=4.36)
+FastV 推理 Demo (LLaVA 原生)
 
 用法:
-    python demo_fastv.py
-    python demo_fastv.py --model-path liuhaotian/llava-v1.5-7b
-    python demo_fastv.py --fastv-k 2 --fastv-r 0.75
+    bash run.sh python demo_fastv.py --model-path models/llava-v1.5-7b
+    bash run.sh python demo_fastv.py --fastv-k 2 --fastv-r 0.75
 """
 
 import argparse
@@ -22,7 +17,6 @@ from fastv.fastv_llama import compute_image_token_importance, select_important_t
 
 
 def load_image(image_source: str) -> Image.Image:
-    """从 URL 或本地路径加载图片"""
     if image_source.startswith(('http://', 'https://')):
         response = requests.get(image_source)
         image = Image.open(BytesIO(response.content))
@@ -31,12 +25,7 @@ def load_image(image_source: str) -> Image.Image:
     return image.convert('RGB')
 
 
-# ============================================================
-#  LLaVA 原生加载方式
-# ============================================================
-
-def load_model_llava_native(model_path, device):
-    """用 LLaVA 原生 builder 加载模型"""
+def load_model(model_path, device):
     from llava.model.builder import load_pretrained_model
     from llava.mm_utils import get_model_name_from_path
 
@@ -50,13 +39,11 @@ def load_model_llava_native(model_path, device):
     return tokenizer, model, image_processor, context_len
 
 
-def prepare_input_llava_native(tokenizer, image_processor, image, prompt, device):
-    """用 LLaVA 原生方式准备输入"""
+def prepare_input(tokenizer, image_processor, image, prompt, device):
     from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
     from llava.conversation import conv_templates
     from llava.mm_utils import tokenizer_image_token, process_images
 
-    # 构建对话
     conv = conv_templates["v1"].copy()
     if DEFAULT_IMAGE_TOKEN not in prompt:
         prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
@@ -64,14 +51,16 @@ def prepare_input_llava_native(tokenizer, image_processor, image, prompt, device
     conv.append_message(conv.roles[1], None)
     full_prompt = conv.get_prompt()
 
-    input_ids = tokenizer_image_token(full_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
+    input_ids = tokenizer_image_token(
+        full_prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
+    ).unsqueeze(0).to(device)
     image_tensor = process_images([image], image_processor, None).to(device, dtype=torch.float16)
 
     return input_ids, image_tensor
 
 
-def run_vanilla_native(model, tokenizer, input_ids, image_tensor, device):
-    """标准推理 (LLaVA 原生)"""
+def run_vanilla(model, tokenizer, input_ids, image_tensor, device):
+    """标准推理（无 FastV）"""
     torch.cuda.synchronize()
     start = time.time()
 
@@ -86,21 +75,21 @@ def run_vanilla_native(model, tokenizer, input_ids, image_tensor, device):
     torch.cuda.synchronize()
     elapsed = time.time() - start
 
-    # 只解码新生成的 tokens
     new_tokens = output_ids[:, input_ids.shape[1]:]
     response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
     return response, elapsed
 
 
-def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=2, fastv_r=0.75):
-    """带 FastV 的推理 (LLaVA 原生)"""
+def run_fastv(model, tokenizer, input_ids, image_tensor, device, fastv_k=2, fastv_r=0.75):
+    """带 FastV 的推理"""
 
     torch.cuda.synchronize()
     start = time.time()
 
     # Step 1: 完整 prefill，获取注意力权重
+    # 用顶层 model() 而不是 model.model()，因为 LLaVA 在顶层处理 images
     with torch.no_grad():
-        outputs = model.model(
+        outputs = model(
             input_ids,
             images=image_tensor,
             output_attentions=True,
@@ -108,25 +97,18 @@ def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=
             use_cache=True,
         )
 
-    hidden_states = outputs.last_hidden_state
+    logits = outputs.logits
     past_key_values = outputs.past_key_values
-
-    # 通过 lm_head 拿 logits
-    logits = model.lm_head(hidden_states)
     seq_len = logits.shape[1]
 
     # Step 2: 从第 K 层注意力计算 image token 重要性
     attn_k = outputs.attentions[fastv_k - 1]  # (batch, heads, seq, seq)
 
-    # 检测 image token 的范围
-    # LLaVA 会把 IMAGE_TOKEN_INDEX (-200) 展开成 576 个 image tokens
-    # image tokens 通常在 system prompt tokens 之后，user text tokens 之前
+    # 检测 image token 范围
+    # LLaVA 展开 IMAGE_TOKEN_INDEX(-200) 为 576 个 image tokens
     image_token_length = 576
-
-    # 启发式检测: input_ids 中 -200 的位置就是 image 展开后的起始位置
-    # 展开后 seq_len 会比 input_ids 长，差值约等于 image_token_length - 1
     text_len = input_ids.shape[1]
-    expanded = seq_len - text_len  # 大约 575 (576 - 1 个 placeholder)
+
     # 找 IMAGE_TOKEN_INDEX 在 input_ids 中的位置
     img_placeholder_pos = (input_ids[0] == -200).nonzero(as_tuple=True)[0]
     if len(img_placeholder_pos) > 0:
@@ -136,7 +118,7 @@ def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=
 
     # 确保范围合理
     if image_start + image_token_length > seq_len:
-        print(f"  警告: image 范围超出序列 ({image_start}+{image_token_length} > {seq_len})，跳过 FastV")
+        print(f"  警告: image 范围超出序列 ({image_start}+{image_token_length} > {seq_len})，回退 vanilla")
         output_ids = model.generate(input_ids, images=image_tensor, do_sample=False, max_new_tokens=256)
         torch.cuda.synchronize()
         elapsed = time.time() - start
@@ -167,6 +149,8 @@ def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=
     pruned_past = tuple(pruned_past)
 
     # Step 4: 自回归生成
+    # 后续 decode 步骤不需要传 images（已经在 KV cache 里了）
+    # LLaVA 对 input_ids.shape[1]==1 会跳过多模态处理
     next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
     generated_ids = [next_token]
     attn_mask = torch.ones((1, keep_all.shape[0] + 1), dtype=torch.long, device=device)
@@ -175,7 +159,7 @@ def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=
 
     for _ in range(255):
         with torch.no_grad():
-            out = model.model(
+            out = model(
                 next_token,
                 attention_mask=attn_mask,
                 past_key_values=pruned_past,
@@ -183,14 +167,16 @@ def run_fastv_native(model, tokenizer, input_ids, image_tensor, device, fastv_k=
                 return_dict=True,
             )
         pruned_past = out.past_key_values
-        step_logits = model.lm_head(out.last_hidden_state)
-        next_token = step_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         if next_token.item() == eos_token_id:
             break
 
         generated_ids.append(next_token)
-        attn_mask = torch.cat([attn_mask, torch.ones((1, 1), dtype=torch.long, device=device)], dim=1)
+        attn_mask = torch.cat([
+            attn_mask,
+            torch.ones((1, 1), dtype=torch.long, device=device)
+        ], dim=1)
 
     torch.cuda.synchronize()
     elapsed = time.time() - start
@@ -207,16 +193,16 @@ def main():
     parser.add_argument('--image-url', type=str,
                         default='https://llava-vl.github.io/static/images/view.jpg')
     parser.add_argument('--prompt', type=str, default='Describe this image in detail.')
-    parser.add_argument('--fastv-k', type=int, default=2, help='FastV K 参数 (在第几层剪枝)')
-    parser.add_argument('--fastv-r', type=float, default=0.75, help='FastV R 参数 (剪枝比例)')
+    parser.add_argument('--fastv-k', type=int, default=2, help='FastV K 参数')
+    parser.add_argument('--fastv-r', type=float, default=0.75, help='FastV R 参数')
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
 
     device = args.device
 
-    # 加载模型 (LLaVA 原生方式)
+    # 加载模型
     print(f"加载模型: {args.model_path}")
-    tokenizer, model, image_processor, context_len = load_model_llava_native(args.model_path, device)
+    tokenizer, model, image_processor, context_len = load_model(args.model_path, device)
     print(f"  模型加载完成, context_len={context_len}")
 
     # 加载图片
@@ -224,7 +210,7 @@ def main():
     image = load_image(args.image_url)
 
     # 准备输入
-    input_ids, image_tensor = prepare_input_llava_native(
+    input_ids, image_tensor = prepare_input(
         tokenizer, image_processor, image, args.prompt, device
     )
     print(f"  input_ids shape: {input_ids.shape}, image_tensor shape: {image_tensor.shape}")
@@ -232,14 +218,14 @@ def main():
     # GPU 预热
     print("GPU 预热...")
     with torch.no_grad():
-        _ = model.model(input_ids, images=image_tensor, use_cache=False)
+        _ = model(input_ids, images=image_tensor, use_cache=False)
     torch.cuda.synchronize()
 
     # ========== Vanilla ==========
     print("\n" + "=" * 60)
     print("  Vanilla 推理 (无 FastV)")
     print("=" * 60)
-    vanilla_resp, vanilla_time = run_vanilla_native(model, tokenizer, input_ids, image_tensor, device)
+    vanilla_resp, vanilla_time = run_vanilla(model, tokenizer, input_ids, image_tensor, device)
     print(f"  耗时: {vanilla_time:.3f}s")
     print(f"  输出: {vanilla_resp[:300]}")
 
@@ -247,7 +233,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"  FastV 推理 (K={args.fastv_k}, R={args.fastv_r})")
     print("=" * 60)
-    fastv_resp, fastv_time, importance = run_fastv_native(
+    fastv_resp, fastv_time, importance = run_fastv(
         model, tokenizer, input_ids, image_tensor, device,
         fastv_k=args.fastv_k, fastv_r=args.fastv_r,
     )

@@ -183,10 +183,13 @@ def run_fastv(model, tokenizer, input_ids, image_tensor, device='cuda',
         print(f"  Pruned 序列: {pruned_len} tokens (原 {seq_len})")
 
     # Generate with pruned embeds
+    # LLaVA's generate() rejects inputs_embeds, bypass it via parent class
+    from transformers import LlamaForCausalLM
     attention_mask = torch.ones((1, pruned_len), dtype=torch.long, device=device)
 
     with torch.no_grad():
-        output_ids = model.generate(
+        output_ids = LlamaForCausalLM.generate(
+            model,
             inputs_embeds=pruned_embeds,
             attention_mask=attention_mask,
             do_sample=False,

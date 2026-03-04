@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Models (too large for git)
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# Data (too large for git)
+data/
+
+# Results (optional, can track if needed)
+# results/
+
+# Environment
+.env
+venv/
+env/
+*.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Third party
+third_party/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+wandb/

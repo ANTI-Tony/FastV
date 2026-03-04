@@ -1,0 +1,73 @@
+# FastV 实验配置
+
+# 模型配置
+model:
+  name: "liuhaotian/llava-v1.5-7b"
+  dtype: "float16"
+  device_map: "auto"
+
+# FastV 参数扫描
+experiments:
+  # Vanilla baseline
+  - name: "vanilla"
+    fastv:
+      use_fastv: false
+      fastv_k: 2
+      fastv_r: 0.0
+
+  # 论文推荐配置
+  - name: "fastv_k2_r50"
+    fastv:
+      use_fastv: true
+      fastv_k: 2
+      fastv_r: 0.50
+
+  # 论文推荐配置 (激进)
+  - name: "fastv_k2_r75"
+    fastv:
+      use_fastv: true
+      fastv_k: 2
+      fastv_r: 0.75
+
+  # 消融: 不同 K 值
+  - name: "fastv_k1_r50"
+    fastv:
+      use_fastv: true
+      fastv_k: 1
+      fastv_r: 0.50
+
+  - name: "fastv_k3_r50"
+    fastv:
+      use_fastv: true
+      fastv_k: 3
+      fastv_r: 0.50
+
+  # 消融: 不同 R 值
+  - name: "fastv_k2_r25"
+    fastv:
+      use_fastv: true
+      fastv_k: 2
+      fastv_r: 0.25
+
+  - name: "fastv_k2_r90"
+    fastv:
+      use_fastv: true
+      fastv_k: 2
+      fastv_r: 0.90
+
+# 评测数据集
+datasets:
+  textvqa:
+    data_path: "data/textvqa/TextVQA_0.5.1_val.json"
+    image_dir: "data/textvqa/train_images"
+  gqa:
+    data_path: "data/gqa/testdev_balanced_questions.json"
+    image_dir: "data/gqa/images"
+  mme:
+    data_path: "data/mme"
+
+# 评测参数
+eval:
+  max_new_tokens: 128
+  do_sample: false
+  batch_size: 1

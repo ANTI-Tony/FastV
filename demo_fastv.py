@@ -149,19 +149,27 @@ def run_fastv(model, tokenizer, input_ids, image_tensor, device, fastv_k=2, fast
     pruned_past = tuple(pruned_past)
 
     # Step 4: 自回归生成
-    # 后续 decode 步骤不需要传 images（已经在 KV cache 里了）
-    # LLaVA 对 input_ids.shape[1]==1 会跳过多模态处理
+    # 关键: 剪枝后 KV cache 长度变短了，但 RoPE 位置编码必须从原始 seq_len 继续
+    # 否则新 token 的 query 位置和 KV cache 中 key 的位置不匹配 → 生成乱码
     next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
     generated_ids = [next_token]
-    attn_mask = torch.ones((1, keep_all.shape[0] + 1), dtype=torch.long, device=device)
+    pruned_len = keep_all.shape[0]
+    attn_mask = torch.ones((1, pruned_len + 1), dtype=torch.long, device=device)
+
+    # 下一个 token 的真实位置是原始序列长度，不是剪枝后的长度
+    next_pos = seq_len  # = 625, 不是 pruned_len = 193
 
     eos_token_id = tokenizer.eos_token_id or 2
 
     for _ in range(255):
+        # 显式传 position_ids，确保 RoPE 位置正确
+        pos_ids = torch.tensor([[next_pos]], dtype=torch.long, device=device)
+
         with torch.no_grad():
             out = model(
                 next_token,
                 attention_mask=attn_mask,
+                position_ids=pos_ids,
                 past_key_values=pruned_past,
                 use_cache=True,
                 return_dict=True,
@@ -173,6 +181,7 @@ def run_fastv(model, tokenizer, input_ids, image_tensor, device, fastv_k=2, fast
             break
 
         generated_ids.append(next_token)
+        next_pos += 1
         attn_mask = torch.cat([
             attn_mask,
             torch.ones((1, 1), dtype=torch.long, device=device)

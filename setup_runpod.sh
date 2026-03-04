@@ -43,23 +43,29 @@ pip install \
     "huggingface_hub>=0.19.0" \
     "numpy<2.0.0"
 
-# 4. Patch accelerate 跳过 bitsandbytes
-#    问题: 系统 bnb 坏了且无法卸载 (系统包在 venv 外)
-#    accelerate 0.21.0 无条件 import bnb → crash
-#    解决: 直接用 sed patch 文件，不 import 任何 Python 包
-echo "[4/6] Patch accelerate (跳过 bitsandbytes)..."
-ACCEL_BNB="$VENV_DIR/lib/python3.11/site-packages/accelerate/utils/bnb.py"
-if [ -f "$ACCEL_BNB" ]; then
-    # 把 "import bitsandbytes as bnb" 替换成 try/except
-    if grep -q "^import bitsandbytes as bnb" "$ACCEL_BNB"; then
-        sed -i 's/^import bitsandbytes as bnb/try:\n    import bitsandbytes as bnb\nexcept (ImportError, RuntimeError, AttributeError):\n    bnb = None/' "$ACCEL_BNB"
-        echo "  已 patch: $ACCEL_BNB"
-    else
-        echo "  已经 patch 过或无需修改"
-    fi
-else
-    echo "  警告: 找不到 $ACCEL_BNB"
-fi
+# 4. 用空壳 bitsandbytes 覆盖系统坏掉的版本
+#    问题: 系统 bnb 0.41.3 缺 libcusparse.so.11，无法卸载 (在 venv 外)
+#    解决: 在 venv site-packages 里创建一个空壳 bitsandbytes 包
+#         venv 的包优先级高于系统包，所以 import 会找到我们的空壳
+echo "[4/6] 创建 bitsandbytes 空壳包 (替代系统坏掉的版本)..."
+BNB_STUB="$VENV_DIR/lib/python3.11/site-packages/bitsandbytes"
+mkdir -p "$BNB_STUB"
+cat > "$BNB_STUB/__init__.py" << 'STUBEOF'
+# Stub: shadows broken system bitsandbytes
+# FastV only needs inference, no quantization needed
+class _Stub:
+    def __getattr__(self, name):
+        return _Stub()
+    def __call__(self, *args, **kwargs):
+        return _Stub()
+    def __bool__(self):
+        return False
+
+nn = _Stub()
+functional = _Stub()
+optim = _Stub()
+STUBEOF
+echo "  已创建空壳包: $BNB_STUB"
 
 # 5. 安装 LLaVA
 echo "[5/6] 安装 LLaVA..."

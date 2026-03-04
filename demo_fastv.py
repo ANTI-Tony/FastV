@@ -178,9 +178,12 @@ def patch_model_for_fastv(model, fastv_k=2, fastv_r=0.75, image_token_start=35, 
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if layer_output_attentions else 1],)
+                # 提取 KV cache: 位置取决于是否有 attention weights
+                cache_idx = 2 if layer_output_attentions else 1
+                kv_cache = layer_outputs[cache_idx] if len(layer_outputs) > cache_idx else None
+                next_decoder_cache += (kv_cache,)
 
-            if layer_output_attentions and layer_outputs[1] is not None:
+            if layer_output_attentions and len(layer_outputs) > 1 and layer_outputs[1] is not None:
                 if all_self_attns is None:
                     all_self_attns = ()
                 all_self_attns += (layer_outputs[1],)
@@ -224,7 +227,10 @@ def patch_model_for_fastv(model, fastv_k=2, fastv_r=0.75, image_token_start=35, 
 
                 # 更新 KV cache (已缓存的层也需要剪枝)
                 pruned_cache = ()
-                for layer_cache in next_decoder_cache:
+                for i, layer_cache in enumerate(next_decoder_cache):
+                    if layer_cache is None:
+                        pruned_cache += (None,)
+                        continue
                     k, v = layer_cache[0], layer_cache[1]
                     pruned_cache += ((k[:, :, keep_indices, :], v[:, :, keep_indices, :]),)
                 next_decoder_cache = pruned_cache

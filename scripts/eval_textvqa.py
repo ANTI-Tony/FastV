@@ -83,8 +83,9 @@ def main():
 
         try:
             image = Image.open(image_path).convert('RGB')
+            vqa_prompt = question + "\nAnswer the question using a single word or phrase."
             input_ids, image_tensor = prepare_input(
-                tokenizer, image_processor, image, question, device
+                tokenizer, image_processor, image, vqa_prompt, device
             )
 
             start = time.time()

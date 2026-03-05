@@ -102,8 +102,10 @@ def run_vanilla(model, tokenizer, input_ids, image_tensor, device='cuda', max_ne
             do_sample=False, max_new_tokens=max_new_tokens,
         )
 
-    new_tokens = output_ids[:, input_ids.shape[1]:]
-    response = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+    # LLaVA's generate uses inputs_embeds internally, so output_ids
+    # only contains [bos + generated tokens], NOT the full input sequence.
+    # Just decode everything and let skip_special_tokens handle bos.
+    response = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
     return response
 
 

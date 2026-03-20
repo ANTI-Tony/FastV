@@ -15,9 +15,9 @@ from dataclasses import dataclass
 class RPAConfig:
     # ---- compression schedule ----
     check_interval: int = 32        # check absorption every K generated tokens
-    compress_ratio: float = 0.7     # keep this fraction of visual tokens each step
+    compress_ratio: float = 0.75    # keep this fraction of visual tokens each step
     min_visual_tokens: int = 64     # never compress below this
-    warmup_tokens: int = 16         # don't compress during first N generated tokens
+    warmup_tokens: int = 64         # don't compress during first N generated tokens
 
     # ---- absorption detection ----
     ranking_layer: int = 2          # which layer's attention to monitor (1-indexed)

@@ -70,7 +70,18 @@ class TextVQAEvaluator(DatasetEvaluator):
         return sample['question'] + "\nAnswer the question using a single word or phrase."
 
     def get_image_path(self, sample, image_dir):
-        return os.path.join(image_dir, f"{sample['image_id']}.jpg")
+        img_id = str(sample['image_id'])
+        # Try common extensions and naming patterns
+        for ext in ['.jpg', '.png', '.jpeg']:
+            path = os.path.join(image_dir, img_id + ext)
+            if os.path.exists(path):
+                return path
+        # Try without extension (maybe image_id already has it)
+        path = os.path.join(image_dir, img_id)
+        if os.path.exists(path):
+            return path
+        # Fallback
+        return os.path.join(image_dir, img_id + '.jpg')
 
     def compute_accuracy(self, pred, sample):
         pred = pred.strip().lower()
@@ -148,13 +159,21 @@ class DocVQAEvaluator(DatasetEvaluator):
         return samples[:max_samples] if max_samples > 0 else samples
 
     def format_prompt(self, sample):
-        return sample['question'] + "\nAnswer the question using the text in the document."
+        return sample['question'] + "\nAnswer the question briefly based on the document."
 
     def get_image_path(self, sample, image_dir):
-        img = sample.get('image', sample.get('image_id', ''))
-        if not img.endswith(('.png', '.jpg')):
-            img = img + '.png'
-        return os.path.join(image_dir, img)
+        # Support both formats: {'image': 'filename.png'} and {'image_id': 'doc_0'}
+        img = sample.get('image', '')
+        if img and not os.path.isabs(img):
+            path = os.path.join(image_dir, img)
+            if os.path.exists(path):
+                return path
+        img_id = sample.get('image_id', '')
+        for ext in ['.png', '.jpg', '.jpeg']:
+            path = os.path.join(image_dir, str(img_id) + ext)
+            if os.path.exists(path):
+                return path
+        return os.path.join(image_dir, img if img else str(img_id) + '.png')
 
     def compute_accuracy(self, pred, sample):
         pred = pred.strip().lower()
@@ -162,7 +181,9 @@ class DocVQAEvaluator(DatasetEvaluator):
         if isinstance(answers, str):
             answers = [answers]
         for a in answers:
-            if a.strip().lower() in pred or pred in a.strip().lower():
+            a_lower = a.strip().lower()
+            # Exact match or containment (either direction)
+            if pred == a_lower or a_lower in pred or pred in a_lower:
                 return 1.0
         return 0.0
 

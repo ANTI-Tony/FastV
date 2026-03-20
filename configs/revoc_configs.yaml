@@ -1,0 +1,131 @@
+# ReVoC (Recoverable Visual Compression) experiment configs
+
+model:
+  name: "liuhaotian/llava-v1.5-7b"
+  dtype: "float16"
+  device_map: "auto"
+
+# Core compression config
+revoc:
+  n_global: 32
+  n_clusters: 64
+  image_token_length: 576
+  hidden_dim: 4096
+  image_grid_h: 24
+  image_grid_w: 24
+  ranking_layer: 2
+  entropy_global_percentile: 90.0
+
+# Retrieval experiments
+experiments:
+  # Default: 12 clusters unpacked, cosine retriever
+  - name: "revoc_cosine_default"
+    retriever:
+      type: "cosine"
+      n_retrieve_clusters: 12
+      history_weight: 0.3
+      ema_decay: 0.7
+
+  # Learned retriever
+  - name: "revoc_learned_default"
+    retriever:
+      type: "cross_attention"
+      n_retrieve_clusters: 12
+      history_weight: 0.3
+      ema_decay: 0.7
+      weights: "checkpoints/retriever.pt"
+
+  # Light: fewer clusters unpacked
+  - name: "revoc_light"
+    retriever:
+      type: "cosine"
+      n_retrieve_clusters: 6
+      history_weight: 0.3
+      ema_decay: 0.7
+
+  # Heavy: more clusters unpacked
+  - name: "revoc_heavy"
+    retriever:
+      type: "cosine"
+      n_retrieve_clusters: 24
+      history_weight: 0.3
+      ema_decay: 0.7
+
+  # No dialogue history (ablation)
+  - name: "revoc_no_history"
+    retriever:
+      type: "cosine"
+      n_retrieve_clusters: 12
+      history_weight: 0.0
+      ema_decay: 0.01
+
+  # More clusters, less per cluster
+  - name: "revoc_128clusters"
+    compression:
+      n_clusters: 128
+    retriever:
+      type: "cosine"
+      n_retrieve_clusters: 16
+
+# Baseline methods for comparison
+baselines:
+  vanilla:
+    tokens_per_round: 576
+  fastv_r50:
+    fastv_k: 2
+    fastv_r: 0.50
+    tokens_per_round: 288
+  fastv_r75:
+    fastv_k: 2
+    fastv_r: 0.75
+    tokens_per_round: 144
+  sparsevlm:
+    note: "Text-guided per-layer sparsification (ICML 2025)"
+  sparsevila:
+    note: "Decoupled prefill/decode sparsity (ICCV 2025)"
+
+# Distillation training
+distillation:
+  data_path: "data/textvqa/TextVQA_0.5.1_val.json"
+  image_dir: "data/textvqa/train_images"
+  max_samples: 2000
+  epochs: 3
+  lr: 1e-4
+  batch_size: 4
+  output: "checkpoints/retriever.pt"
+
+# Evaluation
+eval:
+  max_new_tokens: 128
+  do_sample: false
+  rounds_per_image: 3
+  max_images: 100
+
+# Datasets
+datasets:
+  textvqa:
+    data_path: "data/textvqa/TextVQA_0.5.1_val.json"
+    image_dir: "data/textvqa/train_images"
+  visdial:
+    data_path: "data/visdial/visdial_1.0_val.json"
+    image_dir: "data/visdial/images"
+  gqa:
+    data_path: "data/gqa/testdev_balanced_questions.json"
+    image_dir: "data/gqa/images"
+
+# Multi-model evaluation (CCF-A requirement)
+models:
+  - name: "LLaVA-1.5-7B"
+    path: "liuhaotian/llava-v1.5-7b"
+    adapter: "llava"
+  - name: "LLaVA-1.5-13B"
+    path: "liuhaotian/llava-v1.5-13b"
+    adapter: "llava"
+  - name: "InternVL-2"
+    path: "OpenGVLab/InternVL2-8B"
+    adapter: "internvl"
+    note: "Requires internvl adapter implementation"
+  - name: "Qwen-VL"
+    path: "Qwen/Qwen-VL-Chat"
+    adapter: "qwen-vl"
+    note: "Requires qwen-vl adapter implementation"

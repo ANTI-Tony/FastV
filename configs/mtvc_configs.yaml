@@ -1,0 +1,89 @@
+# MTVC (Multi-Granularity Visual Token Cache) 实验配置
+
+# 模型配置
+model:
+  name: "liuhaotian/llava-v1.5-7b"
+  dtype: "float16"
+  device_map: "auto"
+
+# MTVC 缓存配置
+mtvc:
+  # 三级缓存大小
+  l1_size: 32       # 空间平均池化 → 场景级语义
+  l2_size: 128      # 注意力排序 top-128 → 区域级信息
+  l3_size: 448      # 剩余 tokens → 细粒度细节
+
+  # 空间池化网格 (24x24 → 4x8 超像素)
+  grid_h: 4
+  grid_w: 8
+  image_grid_h: 24
+  image_grid_w: 24
+
+  # 注意力排序层
+  ranking_layer: 2
+
+  # 总 image tokens
+  image_token_length: 576
+
+# 检索配置实验
+experiments:
+  # 默认配置: 32 + 64 + 54 = 150 tokens
+  - name: "mtvc_default"
+    retrieval:
+      k2: 64
+      k3: 54
+      total: 150
+
+  # 轻量配置: 32 + 32 + 32 = 96 tokens
+  - name: "mtvc_light"
+    retrieval:
+      k2: 32
+      k3: 32
+      total: 96
+
+  # 重度配置: 32 + 128 + 100 = 260 tokens
+  - name: "mtvc_heavy"
+    retrieval:
+      k2: 128
+      k3: 100
+      total: 260
+
+  # 仅 L1+L2 (无细粒度): 32 + 64 + 0 = 96 tokens
+  - name: "mtvc_no_l3"
+    retrieval:
+      k2: 64
+      k3: 0
+      total: 96
+
+  # 仅 L1 (最简): 32 + 0 + 0 = 32 tokens
+  - name: "mtvc_l1_only"
+    retrieval:
+      k2: 0
+      k3: 0
+      total: 32
+
+# 对比方法
+baselines:
+  vanilla:
+    tokens_per_round: 576
+  fastv_r50:
+    fastv_k: 2
+    fastv_r: 0.50
+    tokens_per_round: 288
+  fastv_r75:
+    fastv_k: 2
+    fastv_r: 0.75
+    tokens_per_round: 144
+
+# 多轮评测配置
+eval:
+  max_new_tokens: 128
+  do_sample: false
+  rounds_per_image: 3
+  max_images: 100
+
+# 数据集
+datasets:
+  textvqa:
+    data_path: "data/textvqa/TextVQA_0.5.1_val.json"
+    image_dir: "data/textvqa/train_images"

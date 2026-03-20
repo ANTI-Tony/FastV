@@ -117,9 +117,13 @@ def main():
     # ===== Theoretical bounds =====
     if engine.session.cache is not None:
         cache = engine.session.cache
+        # Filter to only clustered tokens (exclude global tokens marked as -1)
+        clustered_mask = cache.cluster_assignments >= 0
+        clustered_features = cache.image_features[clustered_mask]
+        clustered_assignments = cache.cluster_assignments[clustered_mask]
         bounds = compute_compression_bounds(
-            cache.image_features,
-            cache.cluster_assignments[cache.cluster_assignments >= 0],
+            clustered_features,
+            clustered_assignments,
             cache.cluster_centers,
             n_unpacked=config.n_retrieve_clusters,
         )

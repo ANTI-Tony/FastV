@@ -133,7 +133,7 @@ def _build_global_summary(
     gh, gw = config.image_grid_h, config.image_grid_w
 
     # Select high-entropy tokens
-    threshold = torch.quantile(entropy, config.entropy_global_percentile / 100.0)
+    threshold = torch.quantile(entropy.float(), config.entropy_global_percentile / 100.0)
     high_entropy_mask = entropy >= threshold
 
     # Ensure we have enough tokens (at least n_global)

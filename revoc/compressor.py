@@ -202,29 +202,39 @@ def _kmeans_cluster(
         assignments = torch.arange(M, device=device)
         return centers, assignments
 
+    # Cast to float32 for numerical stability (FP16 causes inf in cdist)
+    features_f = features.float()
+
     # Initialize with k-means++ style: first center random, rest by distance
     indices = [torch.randint(0, M, (1,)).item()]
     for _ in range(n_clusters - 1):
-        dists = torch.cdist(features, features[indices])  # (M, len(indices))
+        centers_so_far = features_f[indices]  # (len, D)
+        dists = torch.cdist(features_f, centers_so_far)  # (M, len)
         min_dists = dists.min(dim=1).values  # (M,)
         # Sample proportional to distance squared
         probs = min_dists ** 2
-        probs = probs / probs.sum()
-        next_idx = torch.multinomial(probs, 1).item()
+        probs = probs.clamp(min=0)  # remove any negative from float errors
+        total = probs.sum()
+        if total == 0 or torch.isnan(total) or torch.isinf(total):
+            # Fallback: pick random
+            next_idx = torch.randint(0, M, (1,)).item()
+        else:
+            probs = probs / total
+            next_idx = torch.multinomial(probs, 1).item()
         indices.append(next_idx)
 
-    centers = features[indices].clone()  # (K, D)
+    centers = features_f[indices].clone()  # (K, D) float32
 
     # Iterate
     for _ in range(max_iter):
         # Assign
-        dists = torch.cdist(features, centers)  # (M, K)
+        dists = torch.cdist(features_f, centers)  # (M, K)
         assignments = dists.argmin(dim=1)  # (M,)
 
         # Update centers
         new_centers = torch.zeros_like(centers)
         counts = torch.zeros(n_clusters, device=device)
-        new_centers.scatter_add_(0, assignments.unsqueeze(1).expand(-1, D), features)
+        new_centers.scatter_add_(0, assignments.unsqueeze(1).expand(-1, D), features_f)
         counts.scatter_add_(0, assignments, torch.ones(M, device=device))
         mask = counts > 0
         new_centers[mask] = new_centers[mask] / counts[mask].unsqueeze(1)
@@ -236,7 +246,8 @@ def _kmeans_cluster(
         centers = new_centers
 
     # Final assignment
-    dists = torch.cdist(features, centers)
+    dists = torch.cdist(features_f, centers)
     assignments = dists.argmin(dim=1)
 
-    return centers, assignments
+    # Cast centers back to original dtype
+    return centers.to(features.dtype), assignments

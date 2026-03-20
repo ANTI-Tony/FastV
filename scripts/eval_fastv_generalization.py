@@ -120,17 +120,23 @@ class POPEEvaluator(DatasetEvaluator):
     def load_data(self, data_path, image_dir, max_samples):
         samples = []
         # POPE has multiple files: popular, random, adversarial
+        # Try multiple possible paths for each variant
         for variant in ['popular', 'random', 'adversarial']:
-            fpath = os.path.join(data_path, f"coco_pope_{variant}.json")
-            if not os.path.exists(fpath):
-                # try alternate path
-                fpath = os.path.join(data_path, f"coco/{variant}.json")
-            if os.path.exists(fpath):
-                with open(fpath) as f:
-                    for line in f:
-                        item = json.loads(line.strip())
-                        item['variant'] = variant
-                        samples.append(item)
+            candidates = [
+                os.path.join(data_path, f"coco/coco_pope_{variant}.json"),
+                os.path.join(data_path, f"coco_pope_{variant}.json"),
+                os.path.join(data_path, f"coco/{variant}.json"),
+            ]
+            for fpath in candidates:
+                if os.path.exists(fpath):
+                    with open(fpath) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                item = json.loads(line)
+                                item['variant'] = variant
+                                samples.append(item)
+                    break
         return samples[:max_samples] if max_samples > 0 else samples
 
     def format_prompt(self, sample):
